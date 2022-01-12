@@ -2,9 +2,10 @@ ThisBuild / organization := "com.github.liorregev"
 ThisBuild / homepage := Some(url("https://github.com/sbt/sbt-hello"))
 
 lazy val root = (project in file("."))
-  .enablePlugins(SbtPlugin, GitVersioning)
+  .enablePlugins(SbtPlugin)
   .settings(
     name := "sbt-vault",
+    version := "0.0.1",
     pluginCrossBuild / sbtVersion := {
       scalaBinaryVersion.value match {
         case "2.12" => "1.2.8" // set minimum sbt version
