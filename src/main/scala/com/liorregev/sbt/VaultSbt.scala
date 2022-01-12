@@ -10,6 +10,7 @@ import sttp.client3._
 
 import java.time.Instant
 import scala.collection.JavaConverters._
+import scala.util.Try
 
 object VaultSbt {
   sealed trait LoginMethod
@@ -24,7 +25,7 @@ object VaultSbt {
   object VaultKeys {
     val vaultAddress = settingKey[String]("Address of the Vault server")
     val credentialsKeys = settingKey[Seq[vault.CredentialsKey]]("Data on credentials to fetch")
-    val loginMethod = settingKey[LoginMethod]("Method to log in with")
+    val selectedLoginMethods = settingKey[Seq[LoginMethod]]("Methods to log in with")
     val resolveCreds = taskKey[Either[List[String], List[Credentials]]]("Resolve credentials")
   }
 
@@ -32,7 +33,7 @@ object VaultSbt {
     val vaultAddress = VaultKeys.vaultAddress
     val credentialsKeys = VaultKeys.credentialsKeys
     val resolveCredentials = VaultKeys.resolveCreds
-    val loginMethod = VaultKeys.loginMethod
+    val selectedLoginMethods = VaultKeys.selectedLoginMethods
     val loginMethods: LoginMethods.type = LoginMethods
     final case class CredentialsKey(vaultKey: String, internalUserKey: String, internalPasswordKey: String,
                                     realm: String, host: String)
@@ -72,22 +73,26 @@ object VaultSbt {
     new Auth(config).loginByGCP(role, jwt).getAuthClientToken
   }
 
-  def loadToken(config: VaultConfig): LoginMethod => String = {
-    case LoginMethods.None => config.getToken
+  def loadToken(config: VaultConfig): LoginMethod => Option[String] = {
+    case LoginMethods.None => Try(config.getToken).toOption
     case LoginMethods.UserPass(user, password) =>
-      new Auth(config).loginByUserPass(user, password).getAuthClientToken
-    case LoginMethods.GCPServiceAccount(role) => loadTokenFromGCP(role, config)
-    case LoginMethods.Token(token) => token
+      Try(new Auth(config).loginByUserPass(user, password).getAuthClientToken).toOption
+    case LoginMethods.GCPServiceAccount(role) => Try(loadTokenFromGCP(role, config)).toOption
+    case LoginMethods.Token(token) => Option(token)
   }
 
   def projectSettings: Seq[Setting[_]] = Seq(
     vaultAddress := "",
     credentialsKeys := Seq.empty,
-    loginMethod := LoginMethods.None,
+    selectedLoginMethods := Seq.empty,
     resolveCreds := {
       val config = new VaultConfig()
         .address(vaultAddress.value)
-      val token = loadToken(config.build())(loginMethod.value)
+      val tokenLoader = loadToken(config.build())
+      val token = selectedLoginMethods.value
+        .map(tokenLoader)
+        .reduce(_ orElse _)
+        .get
       val vaultClient = new Vault(config.token(token).build())
       credentialsKeys.value
         .map(key => {
