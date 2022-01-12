@@ -4,3 +4,4 @@
 .bsp/
 target
 null/
+src/sbt-test/vault/**/build.sbt
