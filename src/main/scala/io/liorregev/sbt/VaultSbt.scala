@@ -23,24 +23,27 @@ object VaultSbt {
 
 
   object VaultKeys {
-    val vaultAddress = settingKey[String]("Address of the Vault server")
+    val vaultAddress = settingKey[vault.VaultConnection]("Address of the Vault server")
     val credentialsKeys = settingKey[Seq[vault.CredentialsKey]]("Data on credentials to fetch")
     val genericSecrets = settingKey[Seq[String]]("Paths of generic secrets to fetch, will be available under 'fetchedSecrets'")
     val fetchedSecrets = taskKey[Map[String, Map[String, String]]]("The fetched data of secrets defined in 'genericSecrets'")
     val selectedLoginMethods = settingKey[Seq[LoginMethod]]("Methods to log in with")
-    val resolveCreds = taskKey[Either[Seq[String], Seq[Credentials]]]("Resolve credentials")
   }
 
   object vault {
     val vaultAddress = VaultKeys.vaultAddress
     val credentialsKeys = VaultKeys.credentialsKeys
-    val resolveCredentials = VaultKeys.resolveCreds
     val selectedLoginMethods = VaultKeys.selectedLoginMethods
     val genericSecrets = VaultKeys.genericSecrets
     val fetchedSecrets = VaultKeys.fetchedSecrets
     val loginMethods: LoginMethods.type = LoginMethods
     final case class CredentialsKey(vaultKey: String, internalUserKey: String, internalPasswordKey: String,
                                     realm: String, host: String)
+    final case class VaultConnection(host: String, engineVersion: Int)
+
+    object VaultConnection {
+      def apply(host: String): VaultConnection = new VaultConnection(host, 2)
+    }
   }
 
   import VaultKeys._
@@ -85,9 +88,10 @@ object VaultSbt {
     case LoginMethods.Token(token) => Option(token)
   }
 
-  def createVaultClient(address: String, loginMethods: Seq[LoginMethod]): Vault = {
+  def createVaultClient(conn: vault.VaultConnection, loginMethods: Seq[LoginMethod]): Vault = {
     val config = new VaultConfig()
-      .address(address)
+      .address(conn.host)
+      .engineVersion(conn.engineVersion)
     val tokenLoader = loadToken(config.build())
     val token = loginMethods
       .map(tokenLoader)
@@ -104,29 +108,30 @@ object VaultSbt {
         case (Right(_), Left(l)) => Left(List(l))
       }
 
+  def resolveCreds(conn: vault.VaultConnection, loginMethods: Seq[LoginMethod], keys: Seq[vault.CredentialsKey]): Either[Seq[String], Seq[Credentials]] = {
+    lazy val vaultClient = createVaultClient(conn, loginMethods)
+    val results = keys
+      .map(key => {
+        val response = vaultClient.logical().read(key.vaultKey)
+        Option(response.getRestResponse)
+          .map(resp => {
+            if(resp.getStatus == 200) {
+              val secret = response.getData.asScala
+              Right(Credentials(key.realm, key.host, secret(key.internalUserKey), secret(key.internalPasswordKey)))
+            } else {
+              Left(s"Could not resolve credentials from Vault (${key.vaultKey}): ${resp.getStatus}")
+            }
+          })
+          .getOrElse(Left(s"Could not resolve credentials from Vault (${key.vaultKey})"))
+      })
+    sequence(results)
+  }
+
   def projectSettings: Seq[Setting[_]] = Seq(
-    vaultAddress := "",
+    vaultAddress := vault.VaultConnection(""),
     credentialsKeys := Seq.empty,
     genericSecrets := Seq.empty,
     selectedLoginMethods := Seq.empty,
-    resolveCreds := {
-      lazy val vaultClient = createVaultClient(vaultAddress.value, selectedLoginMethods.value)
-      val results = credentialsKeys.value
-        .map(key => {
-          val response = vaultClient.logical().read(key.vaultKey)
-          Option(response.getRestResponse)
-            .map(resp => {
-              if(resp.getStatus == 200) {
-                val secret = response.getData.asScala
-                Right(Credentials(key.realm, key.host, secret(key.internalUserKey), secret(key.internalPasswordKey)))
-              } else {
-                Left(s"Could not resolve credentials from Vault (${key.vaultKey}): ${resp.getStatus}")
-              }
-            })
-            .getOrElse(Left(s"Could not resolve credentials from Vault (${key.vaultKey})"))
-        })
-      sequence(results)
-    },
     fetchedSecrets := {
       val logger = streams.value.log
       lazy val vaultClient = createVaultClient(vaultAddress.value, selectedLoginMethods.value)
@@ -155,7 +160,7 @@ object VaultSbt {
     },
     ThisBuild / credentials ++= {
       val logger = streams.value.log
-      val resolvedCredentials = resolveCreds.value
+      val resolvedCredentials = resolveCreds(vaultAddress.value, selectedLoginMethods.value, credentialsKeys.value)
       resolvedCredentials.fold(
         msgs => {
           msgs.foreach(msg => logger.error(msg))
