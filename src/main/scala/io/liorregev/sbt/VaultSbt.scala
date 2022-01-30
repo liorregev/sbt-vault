@@ -1,4 +1,4 @@
-package com.liorregev.sbt
+package io.liorregev.sbt
 
 import com.bettercloud.vault.api.Auth
 import com.bettercloud.vault.{Vault, VaultConfig}
@@ -25,8 +25,10 @@ object VaultSbt {
   object VaultKeys {
     val vaultAddress = settingKey[String]("Address of the Vault server")
     val credentialsKeys = settingKey[Seq[vault.CredentialsKey]]("Data on credentials to fetch")
+    val genericSecrets = settingKey[Seq[String]]("Paths of generic secrets to fetch, will be available under 'fetchedSecrets'")
+    val fetchedSecrets = taskKey[Map[String, Map[String, String]]]("The fetched data of secrets defined in 'genericSecrets'")
     val selectedLoginMethods = settingKey[Seq[LoginMethod]]("Methods to log in with")
-    val resolveCreds = taskKey[Either[List[String], List[Credentials]]]("Resolve credentials")
+    val resolveCreds = taskKey[Either[Seq[String], Seq[Credentials]]]("Resolve credentials")
   }
 
   object vault {
@@ -34,6 +36,8 @@ object VaultSbt {
     val credentialsKeys = VaultKeys.credentialsKeys
     val resolveCredentials = VaultKeys.resolveCreds
     val selectedLoginMethods = VaultKeys.selectedLoginMethods
+    val genericSecrets = VaultKeys.genericSecrets
+    val fetchedSecrets = VaultKeys.fetchedSecrets
     val loginMethods: LoginMethods.type = LoginMethods
     final case class CredentialsKey(vaultKey: String, internalUserKey: String, internalPasswordKey: String,
                                     realm: String, host: String)
@@ -81,20 +85,33 @@ object VaultSbt {
     case LoginMethods.Token(token) => Option(token)
   }
 
+  def createVaultClient(address: String, loginMethods: Seq[LoginMethod]): Vault = {
+    val config = new VaultConfig()
+      .address(address)
+    val tokenLoader = loadToken(config.build())
+    val token = loginMethods
+      .map(tokenLoader)
+      .reduce(_ orElse _)
+      .get
+    new Vault(config.token(token).build())
+  }
+
+  def sequence[A, B](s: Seq[Either[A, B]]): Either[Seq[A], Seq[B]] =
+    s.foldLeft[Either[List[A], List[B]]](Right(Nil)) {
+        case (Left(ls), Left(l)) => Left(l :: ls)
+        case (Left(ls), _) => Left(ls)
+        case (Right(rs), Right(r)) => Right(r :: rs)
+        case (Right(_), Left(l)) => Left(List(l))
+      }
+
   def projectSettings: Seq[Setting[_]] = Seq(
     vaultAddress := "",
     credentialsKeys := Seq.empty,
+    genericSecrets := Seq.empty,
     selectedLoginMethods := Seq.empty,
     resolveCreds := {
-      val config = new VaultConfig()
-        .address(vaultAddress.value)
-      val tokenLoader = loadToken(config.build())
-      val token = selectedLoginMethods.value
-        .map(tokenLoader)
-        .reduce(_ orElse _)
-        .get
-      val vaultClient = new Vault(config.token(token).build())
-      credentialsKeys.value
+      lazy val vaultClient = createVaultClient(vaultAddress.value, selectedLoginMethods.value)
+      val results = credentialsKeys.value
         .map(key => {
           val response = vaultClient.logical().read(key.vaultKey)
           Option(response.getRestResponse)
@@ -108,12 +125,33 @@ object VaultSbt {
             })
             .getOrElse(Left(s"Could not resolve credentials from Vault (${key.vaultKey})"))
         })
-        .foldLeft[Either[List[String], List[Credentials]]](Right(Nil)) {
-          case (Left(errorsSoFar), Left(error)) => Left(error :: errorsSoFar)
-          case (Left(errorsSoFar), _) => Left(errorsSoFar)
-          case (Right(credsSoFar), Right(creds)) => Right(creds :: credsSoFar)
-          case (Right(_), Left(error)) => Left(List(error))
+      sequence(results)
+    },
+    fetchedSecrets := {
+      val logger = streams.value.log
+      lazy val vaultClient = createVaultClient(vaultAddress.value, selectedLoginMethods.value)
+      val results = genericSecrets.value
+        .map { secretPath =>
+          val response = vaultClient.logical().read(secretPath)
+          Option(response.getRestResponse)
+            .map(resp => {
+              if(resp.getStatus == 200) {
+                val secret = response.getData.asScala.toMap
+                Right(secretPath -> secret)
+              } else {
+                Left(s"Could not resolve secret from Vault ($secretPath): ${resp.getStatus}")
+              }
+            })
+            .getOrElse(Left(s"Could not resolve secrets from Vault ($secretPath)"))
         }
+      sequence(results)
+        .fold(
+          errors => {
+            errors.foreach(err => logger.error(err))
+            Map.empty
+          },
+          _.toMap
+        )
     },
     ThisBuild / credentials ++= {
       val logger = streams.value.log
