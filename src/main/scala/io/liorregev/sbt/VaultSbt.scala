@@ -24,7 +24,11 @@ object VaultSbt {
     final case class Token(token: String) extends LoginMethod
   }
 
-  val resolvedKeys: mutable.Map[vault.CredentialsKey, Future[Either[String, Credentials]]] = mutable.Map.empty
+  final case class KeyResolutionError(message: String) extends Throwable {
+    override val getMessage: String = message
+  }
+
+  val resolvedKeys: mutable.Map[vault.CredentialsKey, Future[Either[KeyResolutionError, Credentials]]] = mutable.Map.empty
 
   object VaultKeys {
     val vaultAddress = settingKey[vault.VaultConnection]("Address of the Vault server")
@@ -112,36 +116,41 @@ object VaultSbt {
 
   def sequence[A, B](s: Seq[Either[A, B]]): Either[Seq[A], Seq[B]] =
     s.foldLeft[Either[List[A], List[B]]](Right(Nil)) {
-        case (Left(ls), Left(l)) => Left(l :: ls)
-        case (Left(ls), _) => Left(ls)
-        case (Right(rs), Right(r)) => Right(r :: rs)
-        case (Right(_), Left(l)) => Left(List(l))
-      }
+      case (Left(ls), Left(l)) => Left(l :: ls)
+      case (Left(ls), _) => Left(ls)
+      case (Right(rs), Right(r)) => Right(r :: rs)
+      case (Right(_), Left(l)) => Left(List(l))
+    }
 
   def resolveCreds(conn: vault.VaultConnection, loginMethods: Seq[LoginMethod], keys: Seq[vault.CredentialsKey])
-                  (implicit ec: ExecutionContext): Future[Either[Seq[String], Seq[Credentials]]] = {
+                  (implicit ec: ExecutionContext): Future[Either[Seq[Throwable], Seq[Credentials]]] = {
     lazy val eventualClient = createVaultClient(conn, loginMethods)
     val eventualResolutions = keys
       .map(key => {
         resolvedKeys.getOrElseUpdate(key, {
-          eventualClient.flatMap( vaultClient =>
-            Future(vaultClient.logical().read(key.vaultKey))
-              .map { response =>
-                Option(response.getRestResponse)
-                  .map(resp => {
-                    if(resp.getStatus == 200) {
-                      val secret = response.getData.asScala
-                      Right(Credentials(key.realm, key.host, secret(key.internalUserKey), secret(key.internalPasswordKey)))
-                    } else {
-                      Left(s"Could not resolve credentials from Vault (${key.vaultKey}): ${resp.getStatus}")
-                    }
-                  })
-                  .getOrElse(Left(s"Could not resolve credentials from Vault (${key.vaultKey})"))
-              }
-          )
+          eventualClient
+            .flatMap( vaultClient =>
+              Future(vaultClient.logical().read(key.vaultKey))
+                .map { response =>
+                  Option(response.getRestResponse)
+                    .map(resp => {
+                      if(resp.getStatus == 200) {
+                        val secret = response.getData.asScala
+                        Right(Credentials(key.realm, key.host, secret(key.internalUserKey), secret(key.internalPasswordKey)))
+                      } else {
+                        Left(KeyResolutionError(s"Could not resolve credentials from Vault (${key.vaultKey}): ${resp.getStatus}"))
+                      }
+                    })
+                    .getOrElse(Left(KeyResolutionError(s"Could not resolve credentials from Vault (${key.vaultKey})")))
+                }
+            )
         })
       })
-    Future.sequence(eventualResolutions).map(sequence)
+    Future.sequence(eventualResolutions).map(sequence).recover {
+      case ex =>
+        println("got here")
+        Left(Seq(ex))
+    }
   }
 
   def projectSettings: Seq[Setting[_]] = {
@@ -168,32 +177,35 @@ object VaultSbt {
                           val secret = response.getData.asScala.toMap
                           Right(secretPath -> secret)
                         } else {
-                          Left(s"Could not resolve secret from Vault ($secretPath): ${resp.getStatus}")
+                          Left(KeyResolutionError(s"Could not resolve secret from Vault ($secretPath): ${resp.getStatus}"))
                         }
                       })
-                      .getOrElse(Left(s"Could not resolve secrets from Vault ($secretPath)"))
+                      .getOrElse(Left(KeyResolutionError(s"Could not resolve secrets from Vault ($secretPath)")))
                   }
               }
           )
         } yield sequence(results)
-        Await.result(
-          eventualResults
-            .map(_.fold(
-              errors => {
-                errors.foreach(err => logger.error(err))
-                Map.empty
-              },
-              _.toMap
-            )),
-          45 seconds
-        )
+        val finalResults = eventualResults
+          .recover {
+            case ex =>
+              println("got here")
+              Left(Seq(ex))
+          }
+          .map(_.fold(
+            errors => {
+              errors.foreach(err => logger.error(err.getMessage))
+              Map.empty[String, Map[String, String]]
+            },
+            _.toMap
+          ))
+        Await.result(finalResults, 45 seconds)
       },
       ThisBuild / credentials ++= {
         val logger = streams.value.log
         val resolvedCredentials = Await.result(resolveCreds(vaultAddress.value, selectedLoginMethods.value, credentialsKeys.value), 1 minute)
         resolvedCredentials.fold(
           msgs => {
-            msgs.foreach(msg => logger.error(msg))
+            msgs.foreach(msg => logger.error(msg.getMessage))
             Seq.empty
           },
           identity
