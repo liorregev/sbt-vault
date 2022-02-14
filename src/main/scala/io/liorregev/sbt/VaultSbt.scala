@@ -28,7 +28,7 @@ object VaultSbt {
     override val getMessage: String = message
   }
 
-  val resolvedKeys: mutable.Map[vault.CredentialsKey, Future[Either[KeyResolutionError, Credentials]]] = mutable.Map.empty
+  val resolvedKeys: mutable.Map[vault.CredentialsKey, Future[Either[Throwable, Credentials]]] = mutable.Map.empty
 
   object VaultKeys {
     val vaultAddress = settingKey[vault.VaultConnection]("Address of the Vault server")
@@ -143,14 +143,13 @@ object VaultSbt {
                     })
                     .getOrElse(Left(KeyResolutionError(s"Could not resolve credentials from Vault (${key.vaultKey})")))
                 }
+                .recover {
+                  case ex => Left(ex)
+                }
             )
         })
       })
-    Future.sequence(eventualResolutions).map(sequence).recover {
-      case ex =>
-        println("got here")
-        Left(Seq(ex))
-    }
+    Future.sequence(eventualResolutions).map(sequence)
   }
 
   def projectSettings: Seq[Setting[_]] = {
@@ -191,7 +190,7 @@ object VaultSbt {
           }
           .map(_.fold(
             errors => {
-              errors.foreach(err => logger.error(err.getMessage))
+              errors.map(_.getMessage).foreach(msg => logger.error(msg))
               Map.empty[String, Map[String, String]]
             },
             _.toMap
@@ -202,8 +201,8 @@ object VaultSbt {
         val logger = streams.value.log
         val resolvedCredentials = Await.result(resolveCreds(vaultAddress.value, selectedLoginMethods.value, credentialsKeys.value), 1 minute)
         resolvedCredentials.fold(
-          msgs => {
-            msgs.foreach(msg => logger.error(msg.getMessage))
+          errors => {
+            errors.map(_.getMessage).foreach(msg => logger.error(msg))
             Seq.empty
           },
           identity
