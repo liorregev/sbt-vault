@@ -187,9 +187,7 @@ object VaultSbt {
         } yield sequence(results)
         val finalResults = eventualResults
           .recover {
-            case ex =>
-              println("got here")
-              Left(Seq(ex))
+            case ex => Left(Seq(ex))
           }
           .map(_.fold(
             errors => {
