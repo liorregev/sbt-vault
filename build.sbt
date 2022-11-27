@@ -27,6 +27,7 @@ lazy val root = (project in file("."))
       "AB8E875D69D002C9954830859057948268184B56",
       "ignored"
     ),
+    credentials += Credentials(Path.userHome / ".sbt" / ".sonatype_credentials"),
     libraryDependencies ++= Seq(
       "com.google.cloud"               % "google-cloud-iamcredentials" % "2.0.5",
       "com.softwaremill.sttp.client3" %% "core"                        % "3.3.16",

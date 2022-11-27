@@ -9,6 +9,7 @@ import sbt._
 import sttp.client3._
 
 import java.time.Instant
+import java.util.concurrent.TimeUnit
 import scala.collection.JavaConverters._
 import scala.collection.mutable
 import scala.concurrent.{Await, ExecutionContext, Future}
@@ -34,7 +35,8 @@ object VaultSbt {
     val vaultAddress = settingKey[vault.VaultConnection]("Address of the Vault server")
     val credentialsKeys = settingKey[Seq[vault.CredentialsKey]]("Data on credentials to fetch")
     val genericSecrets = settingKey[Seq[String]]("Paths of generic secrets to fetch, will be available under 'fetchedSecrets'")
-    val fetchedSecrets = taskKey[Map[String, Map[String, String]]]("The fetched data of secrets defined in 'genericSecrets'")
+    val fetchedSecrets = settingKey[Map[String, Map[String, String]]]("The fetched data of secrets defined in 'genericSecrets'")
+    val fetchedCredentials = settingKey[Seq[Credentials]]("The fetched credentials from Vault")
     val selectedLoginMethods = settingKey[Seq[LoginMethod]]("Methods to log in with")
   }
 
@@ -44,6 +46,7 @@ object VaultSbt {
     val selectedLoginMethods = VaultKeys.selectedLoginMethods
     val genericSecrets = VaultKeys.genericSecrets
     val fetchedSecrets = VaultKeys.fetchedSecrets
+    val fetchedCredentials = VaultKeys.fetchedCredentials
     val loginMethods: LoginMethods.type = LoginMethods
     final case class CredentialsKey(vaultKey: String, internalUserKey: String, internalPasswordKey: String,
                                     realm: String, host: String)
@@ -56,49 +59,25 @@ object VaultSbt {
 
   import VaultKeys._
 
-  def loadTokenFromGCP(role: String, config: VaultConfig)(implicit ec: ExecutionContext): Future[String] = {
-    val backend = HttpURLConnectionBackend()
-    val iamClient = {
-      val iamCredentialsSettings = IamCredentialsSettings.newBuilder().build()
-      IamCredentialsClient.create(iamCredentialsSettings)
-    }
-    for {
-      saEmail <- Future {
-        basicRequest
-          .get(uri"http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email")
-          .header("Metadata-Flavor", Option("Google"))
-          .send(backend)
-          .body
-          .fold(identity, identity)
-      }
-      signJwtRequest = {
-        val now = Instant.now()
-        val expires = now.plusSeconds(900)
-        val payload = JsObject(
-          Map[String, JsValue](
-            "iat" -> JsNumber(now.getEpochSecond),
-            "exp" -> JsNumber(expires.getEpochSecond),
-            "sub" -> JsString(saEmail),
-            "aud" -> JsString(s"vault/$role")
-          )
-        )
-        val saName = s"projects/-/serviceAccounts/$saEmail"
-        SignJwtRequest.newBuilder()
-          .setName(saName)
-          .setPayload(payload.toString())
-          .build()
-      }
-      jwt <- Future(iamClient.signJwt(signJwtRequest).getSignedJwt)
-      token <- Future(new Auth(config).loginByGCP(role, jwt).getAuthClientToken)
-    } yield token
+  def closeIamClient(iamClient: IamCredentialsClient)(implicit ec: ExecutionContext): Future[Boolean] = {
+    iamClient.shutdownNow()
 
+    def await(): Future[Boolean] =
+      Future {
+        iamClient.awaitTermination(1, TimeUnit.MINUTES)
+      }.flatMap {
+        case true => Future.successful(true)
+        case false => await()
+      }
+
+    await()
   }
 
   def loadToken(config: VaultConfig)(implicit ec: ExecutionContext): LoginMethod => Future[String] = {
     case LoginMethods.None => Future(config.getToken)
     case LoginMethods.UserPass(user, password) =>
       Future(new Auth(config).loginByUserPass(user, password).getAuthClientToken)
-    case LoginMethods.GCPServiceAccount(role) => loadTokenFromGCP(role, config)
+    case LoginMethods.GCPServiceAccount(role) => GCPTokenResolver.loadTokenFromGCP(role, config)
     case LoginMethods.Token(token) => Future(token)
   }
 
@@ -162,7 +141,7 @@ object VaultSbt {
       genericSecrets := Seq.empty,
       selectedLoginMethods := Seq.empty,
       fetchedSecrets := {
-        val logger = streams.value.log
+        val logger = sLog.value
         val eventualResults = for {
           vaultClient <- createVaultClient(vaultAddress.value, selectedLoginMethods.value)
           results <- Future.sequence(
@@ -197,8 +176,8 @@ object VaultSbt {
           ))
         Await.result(finalResults, 45 seconds)
       },
-      ThisBuild / credentials ++= {
-        val logger = streams.value.log
+      fetchedCredentials := {
+        val logger = sLog.value
         val resolvedCredentials = Await.result(resolveCreds(vaultAddress.value, selectedLoginMethods.value, credentialsKeys.value), 1 minute)
         resolvedCredentials.fold(
           errors => {
@@ -207,7 +186,8 @@ object VaultSbt {
           },
           identity
         )
-      }
+      },
+      ThisBuild / credentials ++= fetchedCredentials.value
     )
   }
 }
