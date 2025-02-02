@@ -24,7 +24,7 @@ lazy val root = (project in file("."))
     credentials += Credentials(
       "GnuPG Key ID",
       "gpg",
-      "AB8E875D69D002C9954830859057948268184B56",
+      "0626E80667A0E5FF39B5C10DAF7A50CD7595825D",
       "ignored"
     ),
     credentials += Credentials(Path.userHome / ".sbt" / ".sonatype_credentials"),

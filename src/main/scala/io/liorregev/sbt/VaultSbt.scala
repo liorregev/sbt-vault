@@ -2,21 +2,20 @@ package io.liorregev.sbt
 
 import com.bettercloud.vault.api.Auth
 import com.bettercloud.vault.{Vault, VaultConfig}
-import com.google.cloud.iam.credentials.v1.{IamCredentialsClient, IamCredentialsSettings, SignJwtRequest}
-import play.api.libs.json.{JsNumber, JsObject, JsString, JsValue}
+import com.google.cloud.iam.credentials.v1.IamCredentialsClient
 import sbt.Keys._
 import sbt._
-import sttp.client3._
 
-import java.time.Instant
 import java.util.concurrent.TimeUnit
 import scala.collection.JavaConverters._
 import scala.collection.mutable
-import scala.concurrent.{Await, ExecutionContext, Future}
 import scala.concurrent.duration._
+import scala.concurrent.{Await, ExecutionContext, Future}
 import scala.language.postfixOps
 
 object VaultSbt {
+  val TIMEOUT: Duration = 45 seconds
+
   sealed trait LoginMethod
   object LoginMethods {
     case object None extends LoginMethod
@@ -88,7 +87,11 @@ object VaultSbt {
     val tokenLoader = loadToken(config.build())
     loginMethods
       .map(tokenLoader)
-      .reduce(_ fallbackTo _)
+      .reduce((x, y) => x
+        .recoverWith {
+          case _ => y
+        }
+      )
       .map(token => new Vault(config.token(token).build()))
 
   }
@@ -174,11 +177,11 @@ object VaultSbt {
             },
             _.toMap
           ))
-        Await.result(finalResults, 45 seconds)
+        Await.result(finalResults, TIMEOUT)
       },
       fetchedCredentials := {
         val logger = sLog.value
-        val resolvedCredentials = Await.result(resolveCreds(vaultAddress.value, selectedLoginMethods.value, credentialsKeys.value), 1 minute)
+        val resolvedCredentials = Await.result(resolveCreds(vaultAddress.value, selectedLoginMethods.value, credentialsKeys.value), TIMEOUT)
         resolvedCredentials.fold(
           errors => {
             errors.map(_.getMessage).foreach(msg => logger.error(msg))
